@@ -15,6 +15,7 @@ from .errors import ApiError
 from .months import InvalidMonth
 from .schemas import (
     BasketCreate,
+    ContinuationRequest,
     PriceBatch,
     ReplacementCreate,
     WeightUpdate,
@@ -177,6 +178,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     # -- publishing ------------------------------------------------------
+
+    @app.post("/baskets/{basket_id}/draft/continuation", status_code=status.HTTP_201_CREATED)
+    def continue_slot(
+        basket_id: int, payload: ContinuationRequest, cfg: Settings = Depends(db)
+    ) -> dict:
+        return store.continue_slot_quotes(
+            cfg.db_path,
+            basket_id,
+            payload.model_dump(),
+            cfg.busy_timeout_ms,
+        )
 
     @app.post("/baskets/{basket_id}/publish", status_code=status.HTTP_201_CREATED)
     def publish(basket_id: int, cfg: Settings = Depends(db)) -> dict:

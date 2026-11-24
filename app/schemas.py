@@ -80,3 +80,22 @@ class ReplacementCreate(StrictModel):
     old_price_cents: int = Field(gt=0, le=10**12)
     new_price_cents: int = Field(gt=0, le=10**12)
 
+
+class ContinuationCandidate(StrictModel):
+    """A potential replacement item with its own month-by-month quotes."""
+
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+    prices: dict[Month, PositiveInt] = Field(min_length=1, max_length=500)
+
+
+class ContinuationRequest(StrictModel):
+    slot_key: str = Field(min_length=1, max_length=64)
+    target_month: Month
+    candidates: list[ContinuationCandidate] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def _target_month(self) -> "ContinuationRequest":
+        _check_month(self.target_month)
+        return self
+

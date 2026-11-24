@@ -19,6 +19,7 @@ import sqlite3
 from hashlib import sha256
 from typing import Any
 
+from .continuation import Candidate, continuity_break, solve
 from .db import read_txn, write_txn
 from .errors import ApiError, conflict, invalid, not_found
 from .index_math import (
@@ -671,6 +672,325 @@ def _item_id(conn: sqlite3.Connection, version_id: int, code: str) -> int:
     if row is None:  # pragma: no cover - callers just loaded this item
         raise not_found("item_not_found", f"item {code!r} does not exist")
     return int(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# Continuation (minimum-replacement chain written back in one transaction)
+# ---------------------------------------------------------------------------
+
+
+def _slot_fingerprint(conn: sqlite3.Connection, draft: sqlite3.Row, slot_key: str) -> str:
+    """Hash of every quote and item-timeline row of one slot in the draft.
+
+    It is an optimistic-concurrency token: planning and the actual write run in
+    separate transactions, so the write re-checks the fingerprint and refuses
+    to overwrite a draft whose slot quotes or item timeline changed meanwhile.
+    Recording prices for *other* slots does not alter this slot's fingerprint;
+    publish/revision is still detected through the draft identity checks.
+    """
+    item_rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT slot_key, code, name, active_from, active_through, predecessor_code "
+            "FROM basket_items WHERE basket_version_id = ? AND slot_key = ? "
+            "ORDER BY code",
+            (draft["id"], slot_key),
+        )
+    ]
+    price_rows = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT p.item_code, p.month, p.price_cents FROM prices p "
+            "JOIN basket_items i ON i.basket_version_id = p.basket_version_id "
+            "AND i.code = p.item_code "
+            "WHERE p.basket_version_id = ? AND i.slot_key = ? "
+            "ORDER BY p.item_code, p.month",
+            (draft["id"], slot_key),
+        )
+    ]
+    canonical = json.dumps(
+        {"items": item_rows, "prices": price_rows},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _plan_payload(plan: Any) -> dict[str, Any]:
+    return {
+        "slot_key": plan.slot_key,
+        "target_month": plan.target_month,
+        "replacement_count": plan.replacement_count,
+        "replacement_months": plan.replacement_months,
+        "segments": [
+            {
+                "item_code": segment.item_code,
+                "item_name": segment.item_name,
+                "active_from": segment.active_from,
+                "active_through": segment.active_through,
+                "switch_month": segment.switch_month,
+                "prices": [
+                    {"month": month, "price_cents": price}
+                    for month, price in segment.prices
+                ],
+            }
+            for segment in plan.segments
+        ],
+    }
+
+
+def continue_slot_quotes(
+    db_path: Any,
+    basket_id: int,
+    payload: dict[str, Any],
+    busy_timeout_ms: int = 5_000,
+) -> dict[str, Any]:
+    """Plan and atomically write the minimum-replacement continuation chain.
+
+    The request supplies a slot, a target month and up to ten candidate items
+    with their month-by-month quotes.  The current open item's draft quotes must
+    be continuous from its start month; the chain starts in its last quote
+    month.  Planning happens against one committed snapshot; the write
+    transaction re-validates the same preconditions and the slot fingerprint,
+    so any concurrent price entry, replacement, publish or revision causes the
+    whole request to be rejected without touching the draft.
+    """
+    slot_key = payload["slot_key"]
+    target_month = payload["target_month"]
+    raw_candidates = payload["candidates"]
+    parse_month(target_month)
+
+    # -- Phase 1: read one committed snapshot and solve against it ----------
+    with read_txn(db_path, busy_timeout_ms) as conn:
+        basket = _basket_row(conn, basket_id)
+        draft = _draft_row(conn, basket_id)
+        data = _load_data(conn, draft["id"], draft["base_month"])
+        fingerprint = _slot_fingerprint(conn, draft, slot_key)
+        draft_id = int(draft["id"])
+        draft_version_no = int(draft["version_no"])
+        basket_name = basket["name"]
+        current_version_id = basket["current_version_id"]
+
+        slot_items = data.items_for_slot(slot_key)
+        if not slot_items:
+            raise not_found(
+                "slot_not_found",
+                f"draft of basket {basket_id} has no slot {slot_key!r}",
+            )
+        current = slot_items[-1]
+        if current.active_through is not None:
+            raise conflict(
+                "slot_timeline_closed",
+                f"slot {slot_key!r} has no open-ended current item; cannot continue it",
+            )
+
+        current_quotes = {
+            month: price
+            for (code, month), price in data.prices.items()
+            if code == current.code
+        }
+        if not current_quotes:
+            raise invalid(
+                "current_item_without_quotes",
+                f"current item {current.code!r} of slot {slot_key!r} has no draft quotes",
+                {"slot_key": slot_key, "item_code": current.code},
+            )
+        first = min(current_quotes)
+        if first != current.active_from:
+            raise invalid(
+                "current_quotes_do_not_start_at_active_from",
+                f"item {current.code!r} starts {current.active_from} but its first quote is {first}",
+                {
+                    "slot_key": slot_key,
+                    "item_code": current.code,
+                    "active_from": current.active_from,
+                    "first_quote_month": first,
+                },
+            )
+        gap = continuity_break(current_quotes)
+        if gap is not None:
+            raise invalid(
+                "current_quote_timeline_not_continuous",
+                f"item {current.code!r} has no quote in {gap}; "
+                "the draft quotes must run continuously from its start month",
+                {"slot_key": slot_key, "item_code": current.code, "month": gap},
+            )
+
+        current_last = max(current_quotes)
+        if month_index(target_month) <= month_index(current_last):
+            raise invalid(
+                "target_month_not_later_than_last_quote",
+                f"target month {target_month} must be later than the last quote month {current_last}",
+                {
+                    "slot_key": slot_key,
+                    "target_month": target_month,
+                    "last_quote_month": current_last,
+                },
+            )
+
+        candidate_codes = [candidate["code"] for candidate in raw_candidates]
+        if len(set(candidate_codes)) != len(candidate_codes):
+            raise conflict(
+                "duplicate_candidate_code",
+                "candidate item codes must be unique within the request",
+            )
+        used_codes = {item.code for item in data.items}
+        reused = sorted(used_codes.intersection(candidate_codes))
+        if reused:
+            raise conflict(
+                "candidate_code_already_used",
+                f"candidate codes already present in the draft: {', '.join(reused)}",
+                {"item_codes": reused},
+            )
+
+        candidates: list[Candidate] = []
+        for entry in raw_candidates:
+            prices = dict(entry["prices"])
+            if month_index(min(prices)) < month_index(current.active_from):
+                raise invalid(
+                    "candidate_quote_before_current_start",
+                    f"candidate {entry['code']!r} quotes a month before the current item's "
+                    f"start month {current.active_from}",
+                    {"item_code": entry["code"], "active_from": current.active_from},
+                )
+            if month_index(max(prices)) > month_index(target_month):
+                raise invalid(
+                    "candidate_quote_beyond_target",
+                    f"candidate {entry['code']!r} has quotes past the target month {target_month}",
+                    {"item_code": entry["code"], "target_month": target_month},
+                )
+            gap = continuity_break(prices)
+            if gap is not None:
+                raise invalid(
+                    "candidate_quote_timeline_not_continuous",
+                    f"candidate {entry['code']!r} has no quote in {gap}",
+                    {"item_code": entry["code"], "month": gap},
+                )
+            candidates.append(Candidate(entry["code"], entry["name"], prices))
+
+        plan = solve(
+            slot_key=slot_key,
+            current_code=current.code,
+            current_name=current.name,
+            current_active_from=current.active_from,
+            current_quotes=current_quotes,
+            candidates=candidates,
+            target_month=target_month,
+        )
+        if plan is None:
+            raise invalid(
+                "no_continuation_chain",
+                f"no chain of the supplied candidates reaches {target_month} for slot {slot_key!r}",
+                {
+                    "slot_key": slot_key,
+                    "target_month": target_month,
+                    "last_quote_month": current_last,
+                },
+            )
+
+    # -- Phase 2: re-validate under a write lock and apply the whole chain --
+    with write_txn(db_path, busy_timeout_ms) as conn:
+        basket_now = _basket_row(conn, basket_id)
+        draft_now = conn.execute(
+            "SELECT * FROM basket_versions WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if draft_now is None:
+            raise conflict(
+                "draft_gone",
+                f"draft version {draft_version_no} of basket {basket_id} no longer exists",
+            )
+        if draft_now["status"] != "draft":
+            raise conflict(
+                "draft_published_concurrently",
+                f"draft version {draft_version_no} was published before the chain could be written",
+            )
+        live_draft = _draft_row(conn, basket_id)
+        if int(live_draft["id"]) != draft_id:
+            raise conflict(
+                "draft_replaced_concurrently",
+                f"basket {basket_id} now has a different draft "
+                f"(version {live_draft['version_no']}); write-back refused",
+            )
+        if int(basket_now["current_version_id"] or 0) != int(
+            current_version_id or 0
+        ):
+            raise conflict(
+                "basket_current_version_changed",
+                "the basket's published version changed while planning",
+            )
+        if _slot_fingerprint(conn, draft_now, slot_key) != fingerprint:
+            raise conflict(
+                "slot_changed_concurrently",
+                f"quotes or item timeline of slot {slot_key!r} changed while planning; "
+                "write-back refused",
+                {"slot_key": slot_key},
+            )
+
+        data_now = _load_data(conn, draft_now["id"], draft_now["base_month"])
+        slot_items_now = data_now.items_for_slot(slot_key)
+        current_now = slot_items_now[-1]
+        if (
+            not slot_items_now
+            or current_now.code != current.code
+            or current_now.active_from != current.active_from
+            or current_now.active_through is not None
+        ):
+            raise conflict(
+                "slot_timeline_changed",
+                f"timeline of slot {slot_key!r} changed while planning; write-back refused",
+                {"slot_key": slot_key},
+            )
+
+        try:
+            for position, segment in enumerate(plan.segments):
+                if segment.switch_month is None:
+                    continue
+                predecessor = plan.segments[position - 1].item_code
+                conn.execute(
+                    "UPDATE basket_items SET active_through = ? "
+                    "WHERE basket_version_id = ? AND code = ?",
+                    (segment.switch_month, draft_id, predecessor),
+                )
+                conn.execute(
+                    "INSERT INTO basket_items "
+                    "(basket_version_id, slot_key, code, name, active_from, active_through, predecessor_code) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        draft_id,
+                        slot_key,
+                        segment.item_code,
+                        segment.item_name,
+                        segment.active_from,
+                        segment.active_through,
+                        predecessor,
+                    ),
+                )
+            conn.executemany(
+                "INSERT INTO prices (basket_version_id, item_code, month, price_cents) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (draft_id, segment.item_code, month, price)
+                    for segment in plan.segments
+                    if segment.switch_month is not None
+                    for month, price in segment.prices
+                ],
+            )
+        except sqlite3.IntegrityError as exc:
+            raise conflict(
+                "continuation_write_conflict",
+                f"writing the continuation chain conflicted with stored data: {exc}",
+            ) from exc
+
+        detail = _draft_detail(conn, basket_id, draft_now)
+
+    return {
+        "basket_id": basket_id,
+        "basket_name": basket_name,
+        "draft_version_no": draft_version_no,
+        "plan": _plan_payload(plan),
+        "draft": detail,
+    }
 
 
 def publish(
