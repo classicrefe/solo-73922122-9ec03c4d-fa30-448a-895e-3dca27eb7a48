@@ -1,0 +1,17 @@
+[project]
+name = "monthly-price-index"
+version = "1.0.0"
+description = "Auditable fixed-weight monthly price index API (FastAPI + SQLite)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.165.0",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.14.4",
+]
+
+[project.optional-dependencies]
+dev = ["httpx==0.28.1", "pytest==9.2.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

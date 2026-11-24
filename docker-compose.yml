@@ -1,0 +1,16 @@
+services:
+  ppi-api:
+    build: .
+    image: ppi-api:local
+    container_name: ppi-api
+    ports:
+      - "8000:8000"
+    environment:
+      PPI_DB_PATH: /data/ppi.sqlite3
+      PPI_BUSY_TIMEOUT_MS: "5000"
+    volumes:
+      - ppi-data:/data
+    restart: unless-stopped
+
+volumes:
+  ppi-data:
